@@ -1,0 +1,86 @@
+===== message 1727 =====
+=== FW v1.13 (v1.12 + Bluefruit.begin + BLE adv) ===
+Initializing Bluefruit BLE stack...
+  Bluefruit.begin() = 1 OK
+  BLE advertising started.
+
+IMU Power = ON (HIGH)
+  1. Pure GPIO INPUT_PULLUP (no Wire1): SDA=1 SCL=1
+
+2. Starting Wire1...
+  3. After Wire1.begin() + setClock  : SDA=1 SCL=1
+
+4. Wire1 scanning address 0x6A...
+   0x6A endTransmission = 0 (0=ACK)
+   WHO_AM_I = 0x6A <<< LSM6DS3TR-C OK! BLE+IMU 共存成功!
+
+5. After Wire1.end()...
+  6. After Wire1.end() (back to GPIO PU): SDA=1 SCL=1
+
+=== TEST COMPLETE ===
+LED slow blink. BLE advertising.
+
+===== message 1856 =====
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Summary:
+1. Primary Request and Intent:
+   - **总体任务**: 调试 Seeed XIAO nRF52840 Sense 固件 (`d:\workspace_esp32\motor-aed-xiao`)，让板载 LSM6DS3TR-C IMU 数据通过 BLE (Bluefruit52Lib + SoftDevice S140) 流式传输。这是一个 Motor AED（自动体外除颤器）项目。
+   - **用户硬性要求**：
+     - 固件启动时**最先打印当前版本号**，且**每次上传的固件版本必须递增**（v1.0→v1.1→...→v2.1）
+     - **所有面向用户的回复使用中文**（代码/日志保留英文原文）
+     - **硬件没有问题**（新主板，无任何焊接，"再次说明 硬件没有问题"）——用户多次强调不能假设硬件故障
+   - **当前焦点**: 让完整 BLE + IMU FIFO 正式固件能工作——v2.0 死在 `Initializing IMU...`，v2.1 逐步诊断死在第 3 步（WHO_AM_I 读）即首次 I2C 事务。
+
+2. Key Technical Concepts:
+   - Seeed XIAO nRF52840 Sense (Adafruit nRF52 core framework-arduinoadafruitnrf52 @1.1.1, PlatformIO platform-seeedboards)
+   - 板载 IMU = **ST LSM6DS3TR-C** (WHO_AM_I=0x6A)，内部 **Wire1** I2C1：D16=P0.27(SCL)、D17=P0.07(SDA)，供电 **D15=P1.08** (PIN_LSM6DS3TR_C_POWER)
+   - **Adafruit pin 映射**：`g_ADigitalPinMap[pin]` 把 Arduino pin 号映射到端口引脚号（D15=40→P1.08, D16=27→P0.27, D17=7→P0.07）；variant.h 里 15/16/17 是 Arduino pin 号
+   - **PIN_CNF 位域**（从 nrf52840_bitfields.h 确认）：DIR_Pos=0 (Output=1), INPUT_Pos=1 (**Connect=0, Disconnect=1**), PULL_Pos=2, DRIVE_Pos=8
+   - **关键教训**：OUTPUT 模式下 IN 寄存器读数不可靠（v1.7 里 P1.08 IN=0 但 IMU 正常供电工作），不能用 digitalRead/IN 判断输出引脚电平
+   - nRF52 Wire 库 `endTransmission(false)` 走 TWIM SUSPEND 分支可能永久死锁；`endTransmission()`（STOP）和 `requestFrom()` 默认安全
+   - POWER/CLOCK 共用基址 **0x40000000**；P0@0x50000000, P1@0x50000300；DCDCEN@0x578, DCDCEN0@0x580, MAINREGSTATUS@0x640（只读）
+   - Bluefruit52Lib library.properties: `depends=Adafruit nRFCrypto, Adafruit TinyUSB Library`；只 include 不调用时 BLE 代码被 gc-sections 裁掉
+   - LSM6DS3TR-C 寄存器：WHO_AM_I 0x0F, CTRL1_XL 0x10, CTRL3_C 0x12, FIFO_CTRL3 0x09, FIFO_CTRL4 0x0A, FIFO_STATUS1 0x3A, FIFO_STATUS2 0x3B, FIFO_DATA_OUT_L 0x3E；CTRL1_XL=0x80(1.66kHz±2g), CTRL3_C=0x01(SW_RESET)/0x44(BDU+IF_INC), FIFO_CTRL4=0x06(Continuous), FIFO_CTRL3=0x01(XL only)
+   - BLE GATT: Service `7e8e0001-73d7-11ee-b96e-0242ac120002`，Data Notify `7e8e0002-...`，Config Write `7e8e0003-...`，设备名 MotorAED-XIAO，MTU 247
+   - 用户已用 nRF Connect 成功连接并看到 Service/特征/启用 Notify（图片证实）
+
+3. Files and Code Sections:
+   - **`src/main.cpp`**（当前 = v2.1 诊断固件）— 逐步 IMU 初始化诊断，每步打印 + LED 闪烁计数。当前卡在第 3 步：
+     ```cpp
+     void imuDiag() {
+       Serial.println("  Step 1: Power ON");
+       pinMode(PIN_IMU_PWR, OUTPUT); digitalWrite(PIN_IMU_PWR, HIGH); delay(100);
+       ...
+       Serial.println("  Step 2: Wire1.begin @100kHz");
+       Wire1.begin(); Wire1.setClock(100000); delay(5);
+       ...
+       Serial.println("  Step 3: WHO_AM_I");
+       uint8_t wai = readReg(REG_WHO_AM_I);   // ← 此处死锁
+       ...
+     }
+     uint8_t readReg(uint8_t reg) {
+       Wire1.beginTransmission(IMU_ADDR); Wire1.write(reg);
+       Wire1.endTransmission();                       // STOP
+       Wire1.requestFrom((uint8_t)IMU_ADDR, (uint8_t)1);
+       return Wire1.read();
+     }
+     void setup() {
+       Serial.println("Initializing BLE...");
+       Bluefruit.begin(); Bluefruit.setName("MotorAED-XIAO");
+       Bluefruit.Advertising.addFlags(...); addName(); start(0);
+       Serial.println("  BLE OK");
+       imuDiag();   // ← 卡在第3步
+     }
+     ```
+   - **v2.0 正式固件**（已替换，但代码逻辑在上下文中）：imuBegin() 顺序 = 供电(20ms) → Wire1.begin + setClock(**400000**) → WHO_AM_I → SW_RESET → CTRL3_C=0x44 → FIFO_CTRL3=0x01 → FIFO_CTRL4=0x06 → CTRL1_XL=0x80。BLE GATT service + notify + config char + 广播。**用户实测死在 Initializing IMU...**
+   - **v1.13 成功固件**（BLE+IMU 共存验证）关键成功序列：
+     ```cpp
+     Bluefruit.begin(); ...Advertising.start(0);
+     delay(500);                                    // ← 关键: BLE 后延时
+     pinMode(PIN_PWR, OUTPUT); digitalWrite(PIN_PWR, HIGH); delay(150);
+     readLevels(...);  // ← 关键: 先 pinMode(SDA/SCL, INPUT_PULLUP) 检查总线
+     Wire1.begin(); Wire1.setClock(100000);
+     Wire1.beginTransmission(0x6A); err = Wire1.endTransmission();  // ← 先纯扫描
+     Wire1.beginTransmission(0x6A); Wire1.write(0x0F); Wire1.endTra
+

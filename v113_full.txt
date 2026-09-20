@@ -1,0 +1,1004 @@
+===== message 1707 =====
+/*
+ * 验证固件 v1.13 - v1.6 基线 + Bluefruit.begin() (完整 BLE 栈)
+ * 目的: 验证 BLE 栈启用后, IMU 还能不能正常工作
+ *  v1.12 (bluefruit.h include only) = 成功
+ *  v1.13 = v1.12 + Bluefruit.begin() + BLE 广播 (完整 BLE 栈)
+ * 如果成功 -> 可以直接做正式固件 (BLE + IMU 共存)
+ * 如果失败 -> 定位 BLE 哪一步破坏了 IMU
+ */
+#include <Arduino.h>
+#include <Wire.h>
+#include <bluefruit.h>
+#include <Adafruit_TinyUSB.h>
+
+#define FW_VERSION "v1.13"
+
+#define PIN_SDA   PIN_WIRE1_SDA
+#define PIN_SCL   PIN_WIRE1_SCL
+#define PIN_PWR   PIN_LSM6DS3TR_C_POWER
+
+void readLevels(const char *label) {
+  Serial.printf("  %-35s: SDA=", label);
+  Serial.flush();
+
+  pinMode(PIN_SDA, INPUT_PULLUP);
+  pinMode(PIN_SCL, INPUT_PULLUP);
+  delay(1);
+  int sda = digitalRead(PIN_SDA);
+  int scl = digitalRead(PIN_SCL);
+  Serial.printf("%d SCL=%d\r\n", sda, scl);
+  Serial.flush();
+}
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  Serial.begin(115200);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) {
+    digitalWrite(LED_BUILTIN, (millis() / 200) & 1 ? HIGH : LOW);
+  }
+
+  Serial.printf("\r\n\r\n=== FW %s (v1.12 + Bluefruit.begin + BLE adv) ===\r\n", FW_VERSION);
+  Serial.flush();
+
+  // ===== 先启用 BLE =====
+  Serial.println("Initializing Bluefruit BLE stack...");
+  Serial.flush();
+  bool ble_ok = Bluefruit.begin();
+  Serial.printf("  Bluefruit.begin() = %d %s\r\n", ble_ok, ble_ok ? "OK" : "FAIL");
+  Serial.flush();
+
+  if (ble_ok) {
+    Bluefruit.setName("XIAO_IMU_Test");
+    Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+    Bluefruit.Advertising.addTxPower();
+    Bluefruit.Advertising.addName();
+    Bluefruit.Advertising.restartOnDisconnect(true);
+    Bluefruit.Advertising.setInterval(32, 244);    // unit: 0.625 ms
+    Bluefruit.Advertising.setFastTimeout(30);      // 秒
+    Bluefruit.Advertising.start(0);                 // 0 = 永远广播
+    Serial.println("  BLE advertising started.");
+  }
+  Serial.flush();
+  delay(500);
+
+  // ===== 再测 IMU =====
+  // 供电
+  pinMode(PIN_PWR, OUTPUT);
+  digitalWrite(PIN_PWR, HIGH);
+  delay(150);
+  Serial.println("\r\nIMU Power = ON (HIGH)");
+  Serial.flush();
+
+  // --- 纯 GPIO ---
+  readLevels("1. Pure GPIO INPUT_PULLUP (no Wire1)");
+
+  // --- 启动 Wire1 ---
+  Serial.println("\r\n2. Starting Wire1...");
+  Serial.flush();
+  Wire1.begin();
+  Wire1.setClock(100000);
+  delay(5);
+  readLevels("3. After Wire1.begin() + setClock");
+
+  // --- 读 WHO_AM_I ---
+  Serial.println("\r\n4. Wire1 scanning address 0x6A...");
+  Serial.flush();
+
+  Wire1.beginTransmission(0x6A);
+  uint8_t err = Wire1.endTransmission();
+  Serial.printf("   0x6A endTransmission = %d (0=ACK)\r\n", err);
+  Serial.flush();
+
+  if (err == 0) {
+    Wire1.beginTransmission(0x6A);
+    Wire1.write(0x0F); // WHO_AM_I
+    Wire1.endTransmission();
+    Wire1.requestFrom((uint8_t)0x6A, (uint8_t)1);
+    uint8_t v = Wire1.read();
+    Serial.printf("   WHO_AM_I = 0x%02X %s\r\n", v,
+                  (v == 0x6A) ? "<<< LSM6DS3TR-C OK! BLE+IMU 共存成功!" : "");
+  }
+  Serial.flush();
+
+  // --- Wire1.end() ---
+  Serial.println("\r\n5. After Wire1.end()...");
+  Wire1.end();
+  delay(2);
+  readLevels("6. After Wire1.end() (back to GPIO PU)");
+
+  Serial.println("\r\n=== TEST COMPLETE ===");
+  Serial.println("LED slow blink. BLE advertising.");
+  Serial.flush();
+}
+
+uint32_t lastBlink = 0;
+bool ledState = false;
+
+void loop() {
+  // BLE 后台任务
+  Bluefruit.Advertising.setLED( digitalRead(LED_BUILTIN) == LED_STATE_ON );
+
+  if (millis() - lastBlink > 1000) {
+    ledState = !ledState;
+    digitalWrite(LED_BUILTIN, ledState);
+    lastBlink = millis();
+  }
+}
+
+
+===== message 1731 =====
+/*
+ * XIAO nRF52840 Sense - Motor AED 正式固件 v2.0
+ *
+ * 功能:
+ *   - LSM6DS3TR-C IMU (Wire1 I2C 0x6A, D15 供电)
+ *   - 加速度采样 + FIFO 模式
+ *   - BLE GATT Service, 数据通过 Notification 流式传输
+ *   - MTU 247 (bluefruit 默认配置)
+ *
+ * 启动顺序: BLE 先初始化 -> IMU 后供电/初始化
+ *   (v1.13 验证此顺序 BLE+IMU 共存正常)
+ */
+#include <Arduino.h>
+#include <Wire.h>
+#include <bluefruit.h>
+#include <Adafruit_TinyUSB.h>
+
+#define FW_VERSION "v2.0"
+
+// ====== IMU 引脚 ======
+#define PIN_IMU_PWR   PIN_LSM6DS3TR_C_POWER
+#define IMU_ADDR      0x6A
+
+// ====== LSM6DS3TR-C 寄存器 ======
+#define REG_WHO_AM_I      0x0F
+#define REG_CTRL1_XL      0x10
+#define REG_CTRL2_G       0x11
+#define REG_CTRL3_C       0x12
+#define REG_CTRL4_C       0x13
+#define REG_FIFO_CTRL3    0x09
+#define REG_FIFO_CTRL4    0x0A
+#define REG_FIFO_STATUS1  0x3A
+#define REG_FIFO_STATUS2  0x3B
+#define REG_FIFO_DATA_OUT_L 0x3E
+
+#define WHO_AM_I_VAL      0x6A
+
+// ====== 采样配置 ======
+// CTRL1_XL: ODR=1.66kHz (0b1000=8kHz? 查 LSM6DS3TR-C datasheet)
+//  ODR_XL[3:0] = 1000 -> 1.66 kHz (high-performance)
+//  FS_XL[1:0]  = 00   -> ±2g
+//  LPF2_XL_EN  = 0
+#define CTRL1_XL_1660HZ_2G  0x80  // ODR=1000(1.66kHz), FS=00(±2g)
+
+// CTRL3_C: BDU=1 (block data update), IF_INC=1 (register auto-increment)
+#define CTRL3_C_BDU_IFINC   0x44  // BDU=1(bit6), IF_INC=1(bit2)
+
+// FIFO_CTRL4: FIFO 模式 = Continuous (0b110)
+//   且只存加速度数据 (FIFO_CTRL3 里设置)
+#define FIFO_CTRL4_CONTINUOUS  0x06  // FIFO_MODE[2:0]=110 = Continuous mode
+#define FIFO_CTRL3_XL_ONLY     0x01  // DEC_FIFO_XL[1:0] = 01 (no decimation), gyro=00 (bypass)
+
+// ====== BLE GATT ======
+// Service UUID: 自定义 128-bit
+//   MotorAED Service:  7e8e0001-73d7-11ee-b96e-0242ac120002
+//   Data Characteristic: 7e8e0002-73d7-11ee-b96e-0242ac120002 (Notify)
+//   Config Characteristic: 7e8e0003-73d7-11ee-b96e-0242ac120002 (Write, 采样率/量程配置)
+
+static const uint8_t SVC_MOTOR_AED_UUID[16] = {
+  0x02, 0x00, 0x12, 0xac, 0x42, 0x02, 0x6e, 0xb9,
+  0xee, 0x11, 0xd7, 0x73, 0x01, 0x00, 0x8e, 0x7e
+};
+static const uint8_t CHR_DATA_UUID[16] = {
+  0x02, 0x00, 0x12, 0xac, 0x42, 0x02, 0x6e, 0xb9,
+  0xee, 0x11, 0xd7, 0x73, 0x02, 0x00, 0x8e, 0x7e
+};
+static const uint8_t CHR_CONFIG_UUID[16] = {
+  0x02, 0x00, 0x12, 0xac, 0x42, 0x02, 0x6e, 0xb9,
+  0xee, 0x11, 0xd7, 0x73, 0x03, 0x00, 0x8e, 0x7e
+};
+
+BLEService motorService(SVC_MOTOR_AED_UUID);
+BLECharacteristic dataChar(CHR_DATA_UUID, BLENotify, 240);
+BLECharacteristic configChar(CHR_CONFIG_UUID, BLEWrite, 16);
+
+// ====== 数据格式 ======
+// 每个采样: 6 bytes (x_l, x_h, y_l, y_h, z_l, z_h)  little-endian int16
+// 一帧最多 240 bytes = 40 个采样
+#define MAX_SAMPLES_PER_PACKET  40
+
+// ====== IMU 低级别 I2C ======
+static bool imu_writeReg(uint8_t reg, uint8_t val) {
+  Wire1.beginTransmission(IMU_ADDR);
+  Wire1.write(reg);
+  Wire1.write(val);
+  return Wire1.endTransmission() == 0;
+}
+
+static bool imu_readReg(uint8_t reg, uint8_t* buf, uint8_t len) {
+  Wire1.beginTransmission(IMU_ADDR);
+  Wire1.write(reg);
+  if (Wire1.endTransmission() != 0) return false;
+  uint8_t got = Wire1.requestFrom((uint8_t)IMU_ADDR, len);
+  if (got < len) return false;
+  for (uint8_t i = 0; i < len; i++) buf[i] = Wire1.read();
+  return true;
+}
+
+static uint8_t imu_readByte(uint8_t reg) {
+  uint8_t v = 0;
+  imu_readReg(reg, &v, 1);
+  return v;
+}
+
+// ====== IMU 初始化 ======
+static bool imuBegin() {
+  // 供电
+  pinMode(PIN_IMU_PWR, OUTPUT);
+  digitalWrite(PIN_IMU_PWR, HIGH);
+  delay(20);
+
+  Wire1.begin();
+  Wire1.setClock(400000);
+  delay(5);
+
+  // 验证 WHO_AM_I
+  uint8_t wai = imu_readByte(REG_WHO_AM_I);
+  if (wai != WHO_AM_I_VAL) {
+    Serial.printf("IMU WHO_AM_I = 0x%02X (expected 0x%02X)\r\n", wai, WHO_AM_I_VAL);
+    return false;
+  }
+
+  // 软件复位 (CTRL3_C SW_RESET)
+  imu_writeReg(REG_CTRL3_C, 0x01); // SW_RESET=1
+  delay(20);
+
+  // CTRL3_C: BDU + IF_INC (寄存器地址自增用于批量读取)
+  imu_writeReg(REG_CTRL3_C, CTRL3_C_BDU_IFINC);
+
+  // FIFO 配置: 只存加速度, 连续模式
+  imu_writeReg(REG_FIFO_CTRL3, FIFO_CTRL3_XL_ONLY);
+  imu_writeReg(REG_FIFO_CTRL4, FIFO_CTRL4_CONTINUOUS);
+
+  // 加速度: 1.66kHz, ±2g
+  imu_writeReg(REG_CTRL1_XL, CTRL1_XL_1660HZ_2G);
+
+  delay(20);
+  return true;
+}
+
+// ====== 读 FIFO ======
+static uint16_t imuReadFifo(uint8_t* buf, uint16_t maxSamples) {
+  // 读 FIFO_STATUS1: FIFO 中的未读取样本数
+  uint8_t status1 = imu_readByte(REG_FIFO_STATUS1);
+  // FIFO_STATUS2 bit6 = FIFO_FULL, bit5=FIFO_OVR
+  uint8_t status2 = imu_readByte(REG_FIFO_STATUS2);
+
+  // 每个加速度样本 = 6 bytes (x, y, z 各 16-bit)
+  // FIFO_STATUS1 是样本计数 (diff_fifo[8:0])
+  // LSM6DS3TR-C FIFO 深度 = 1.5KB = 256 样本 * 6 bytes? 实际深度需核对 datasheet
+  // status1 是低 8 位, status2 的 bit0-2 是高位
+  uint16_t count = (uint16_t)status1 | ((uint16_t)(status2 & 0x07) << 8);
+  if (count > maxSamples) count = maxSamples;
+  if (count == 0) return 0;
+
+  // 批量读 FIFO 数据 (每个样本 6 bytes: X_L, X_H, Y_L, Y_H, Z_L, Z_H)
+  for (uint16_t i = 0; i < count; i++) {
+    Wire1.beginTransmission(IMU_ADDR);
+    Wire1.write(REG_FIFO_DATA_OUT_L);
+    Wire1.endTransmission();
+    uint8_t got = Wire1.requestFrom((uint8_t)IMU_ADDR, (uint8_t)6);
+    for (uint8_t j = 0; j < 6 && j < got; j++) {
+      buf[i*6 + j] = Wire1.read();
+    }
+    if (got < 6) {
+      count = i;
+      break;
+    }
+  }
+
+  return count;
+}
+
+// ====== BLE 连接状态 ======
+static bool connected = false;
+static bool notifyEnabled = false;
+
+void connect_callback(uint16_t conn_handle) {
+  connected = true;
+  BLEConnection* conn = Bluefruit.Connection(conn_handle);
+  char peer_name[32] = { 0 };
+  conn->getPeerName(peer_name, sizeof(peer_name));
+  Serial.printf("[BLE] Connected: %s (handle=%d)\r\n", peer_name, conn_handle);
+
+  // 请求交换 MTU
+  conn->requestMtuExchange();
+}
+
+void disconnect_callback(uint16_t conn_handle, uint8_t reason) {
+  (void)conn_handle;
+  (void)reason;
+  connected = false;
+  notifyEnabled = false;
+  Serial.println("[BLE] Disconnected");
+}
+
+void notify_callback(uint16_t conn_handle, BLECharacteristic* chr, uint16_t value) {
+  (void)conn_handle;
+  (void)chr;
+  notifyEnabled = (value > 0);
+  Serial.printf("[BLE] CCCD: %s\r\n", notifyEnabled ? "Notify ON" : "Notify OFF");
+}
+
+void mtu_changed_callback(uint16_t conn_handle) {
+  BLEConnection* conn = Bluefruit.Connection(conn_handle);
+  uint16_t mtu = conn->getMtu();
+  Serial.printf("[BLE] MTU = %u\r\n", mtu);
+}
+
+void config_write_callback(uint16_t conn_handle, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
+  (void)conn_handle;
+  (void)chr;
+  Serial.printf("[BLE] Config write, %u bytes\r\n", len);
+  // 预留: 动态配置采样率/量程等
+}
+
+// ======  setup ======
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  Serial.begin(115200);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) {
+    digitalWrite(LED_BUILTIN, (millis() / 200) & 1 ? HIGH : LOW);
+  }
+
+  // 版本号最先输出 (用户要求)
+  Serial.printf("\r\n\r\n=== Motor AED XIAO Firmware %s ===\r\n", FW_VERSION);
+  Serial.flush();
+
+  // ---- BLE 初始化 (先于 IMU, v1.13 验证此顺序) ----
+  Serial.println("Initializing BLE...");
+  Serial.flush();
+  if (!Bluefruit.begin()) {
+    Serial.println("  Bluefruit.begin() FAILED!");
+    while (1) { delay(100); }
+  }
+
+  Bluefruit.setName("MotorAED-XIAO");
+  Bluefruit.setTxPower(4); // +4dBm (nRF52840 支持 0/+2/+3/+4/+5/+6/+7/+8)
+
+  // 连接回调
+  Bluefruit.Periph.setConnectCallback(connect_callback);
+  Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
+  Bluefruit.setMtuChangedCallback(mtu_changed_callback);
+
+  // ---- GATT Service ----
+  motorService.begin();
+
+  // Data Characteristic (Notify)
+  dataChar.setProperties(CHR_PROPS_NOTIFY);
+  dataChar.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  dataChar.setCccdWriteCallback(notify_callback);
+  dataChar.begin();
+
+  // Config Characteristic (Write)
+  configChar.setProperties(CHR_PROPS_WRITE);
+  configChar.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  configChar.setWriteCallback(config_write_callback);
+  configChar.begin();
+
+  // ---- 广播 ----
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addTxPower();
+  Bluefruit.Advertising.addService(motorService);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.restartOnDisconnect(true);
+  Bluefruit.Advertising.setInterval(32, 244);
+  Bluefruit.Advertising.setFastTimeout(30);
+  Bluefruit.Advertising.start(0);
+
+  Serial.println("  BLE advertising started.");
+  Serial.flush();
+
+  // ---- IMU 初始化 (在 BLE 之后) ----
+  Serial.println("Initializing IMU...");
+  Serial.flush();
+  if (imuBegin()) {
+    Serial.println("  IMU OK (LSM6DS3TR-C, 1.66kHz, ±2g, FIFO continuous)");
+  } else {
+    Serial.println("  IMU FAILED!");
+    // 不 halt, 继续运行, BLE 仍可用
+  }
+  Serial.flush();
+
+  Serial.printf("=== Setup complete, ready ===\r\n\r\n");
+  Serial.flush();
+
+  digitalWrite(LED_BUILTIN, LOW); // 灭灯 (低电平点亮? 不, XIAO 是高电平灭/低电平亮, 这里先设置为灭)
+}
+
+// ====== loop ======
+static uint32_t lastSend = 0;
+static uint8_t packetBuf[MAX_SAMPLES_PER_PACKET * 6];
+static uint32_t totalSamples = 0;
+
+void loop() {
+  // BLE 后台任务由 Bluefruit 库自动处理 (RTOS 或调度器)
+  // 我们在 loop 里轮询 FIFO
+
+  if (notifyEnabled && connected) {
+    uint16_t samples = imuReadFifo(packetBuf, MAX_SAMPLES_PER_PACKET);
+    if (samples > 0) {
+      totalSamples += samples;
+      dataChar.notify(packetBuf, samples * 6);
+
+      // 每 1000 个采样打印一次统计
+      if (totalSamples % 1000 < samples) {
+        Serial.printf("[IMU] %lu samples sent, FIFO burst=%u\r\n", totalSamples, samples);
+      }
+    }
+  }
+
+  // LED: 连接时快闪, 未连接时慢闪
+  static uint32_t lastBlink = 0;
+  static bool ledOn = false;
+  uint32_t interval = connected ? 200 : 1000;
+  if (millis() - lastBlink > interval) {
+    ledOn = !ledOn;
+    digitalWrite(LED_BUILTIN, ledOn ? LOW : HIGH); // XIAO LED: LOW=亮, HIGH=灭
+    lastBlink = millis();
+  }
+}
+
+
+===== message 1802 =====
+/*
+ * 诊断固件 v2.1 - 正式固件 imuBegin 逐步诊断
+ * 现象: v2.0 正式固件死在 Initializing IMU...
+ * 假设: 400kHz I2C 失败, 或某一步寄存器写入触发死锁
+ * 诊断: 每一步 I2C 操作前打印, 用 100kHz (v1.13 成功的频率), 每步后确认
+ */
+#include <Arduino.h>
+#include <Wire.h>
+#include <bluefruit.h>
+#include <Adafruit_TinyUSB.h>
+
+#define FW_VERSION "v2.1"
+
+#define PIN_IMU_PWR   PIN_LSM6DS3TR_C_POWER
+#define IMU_ADDR      0x6A
+
+#define REG_WHO_AM_I      0x0F
+#define REG_CTRL1_XL      0x10
+#define REG_CTRL3_C       0x12
+#define REG_FIFO_CTRL3    0x09
+#define REG_FIFO_CTRL4    0x0A
+
+void step_led(uint8_t n) {
+  for (uint8_t i = 0; i < n; i++) {
+    digitalWrite(LED_BUILTIN, LOW); delay(80);
+    digitalWrite(LED_BUILTIN, HIGH); delay(80);
+  }
+}
+
+bool writeReg(uint8_t reg, uint8_t val) {
+  Wire1.beginTransmission(IMU_ADDR);
+  Wire1.write(reg);
+  Wire1.write(val);
+  uint8_t err = Wire1.endTransmission();
+  Serial.printf("    writeReg(0x%02X, 0x%02X) = %d\r\n", reg, val, err);
+  Serial.flush();
+  return err == 0;
+}
+
+uint8_t readReg(uint8_t reg) {
+  Wire1.beginTransmission(IMU_ADDR);
+  Wire1.write(reg);
+  Wire1.endTransmission();
+  Wire1.requestFrom((uint8_t)IMU_ADDR, (uint8_t)1);
+  uint8_t v = Wire1.read();
+  Serial.printf("    readReg(0x%02X) = 0x%02X\r\n", reg, v);
+  Serial.flush();
+  return v;
+}
+
+void imuDiag() {
+  Serial.println("  Step 1: Power ON");
+  pinMode(PIN_IMU_PWR, OUTPUT);
+  digitalWrite(PIN_IMU_PWR, HIGH);
+  delay(100);
+  Serial.println("    done.");
+  step_led(1);
+
+  Serial.println("  Step 2: Wire1.begin @100kHz");
+  Wire1.begin();
+  Wire1.setClock(100000);
+  delay(5);
+  Serial.println("    done.");
+  step_led(1);
+
+  Serial.println("  Step 3: WHO_AM_I");
+  uint8_t wai = readReg(REG_WHO_AM_I);
+  Serial.printf("    WHO_AM_I = 0x%02X %s\r\n", wai, (wai == 0x6A) ? "OK" : "FAIL");
+  step_led(2);
+
+  Serial.println("  Step 4: CTRL3_C default");
+  readReg(REG_CTRL3_C);
+  step_led(1);
+
+  Serial.println("  Step 5: SW_RESET (CTRL3_C = 0x01)");
+  writeReg(REG_CTRL3_C, 0x01);
+  delay(50);
+  readReg(REG_CTRL3_C);
+  step_led(2);
+
+  Serial.println("  Step 6: CTRL3_C = BDU + IF_INC (0x44)");
+  writeReg(REG_CTRL3_C, 0x44);
+  readReg(REG_CTRL3_C);
+  step_led(1);
+
+  Serial.println("  Step 7: FIFO_CTRL3 = 0x01 (XL only)");
+  writeReg(REG_FIFO_CTRL3, 0x01);
+  readReg(REG_FIFO_CTRL3);
+  step_led(1);
+
+  Serial.println("  Step 8: FIFO_CTRL4 = 0x06 (Continuous)");
+  writeReg(REG_FIFO_CTRL4, 0x06);
+  readReg(REG_FIFO_CTRL4);
+  step_led(1);
+
+  Serial.println("  Step 9: CTRL1_XL = 0x80 (1.66kHz, 2g)");
+  writeReg(REG_CTRL1_XL, 0x80);
+  readReg(REG_CTRL1_XL);
+  step_led(2);
+
+  Serial.println("  Step 10: 400kHz test");
+  Wire1.setClock(400000);
+  delay(5);
+  readReg(REG_WHO_AM_I);
+  step_led(3);
+
+  Serial.println("  --- IMU diag complete ---");
+}
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // 灭
+
+  Serial.begin(115200);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) {
+    digitalWrite(LED_BUILTIN, (millis() / 200) & 1 ? LOW : HIGH);
+  }
+
+  Serial.printf("\r\n\r\n=== FW %s (imuBegin step-by-step diag) ===\r\n", FW_VERSION);
+  Serial.flush();
+
+  Serial.println("Initializing BLE...");
+  Bluefruit.begin();
+  Bluefruit.setName("MotorAED-XIAO");
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.start(0);
+  Serial.println("  BLE OK");
+  Serial.flush();
+
+  Serial.println("Initializing IMU (step-by-step)...");
+  Serial.flush();
+  imuDiag();
+
+  Serial.println("\r\n=== ALL DONE ===");
+  Serial.flush();
+}
+
+void loop() {
+  delay(100);
+}
+
+
+===== message 1928 =====
+死锁根因清楚了。对比 v1.13 成功固件和 v2.1：
+
+**v1.13 成功序列**：BLE 启动后 `delay(500)` → 供电 `delay(150)` → **`pinMode(SDA/SCL, INPUT_PULLUP)` 总线预检查** → `Wire1.begin() @100kHz` → **先纯扫描**（`endTransmission()` 无数据）→ 寄存器写用 **`endTransmission(false)`** + `requestFrom` 读。
+
+**v2.1 死锁点**：供电后**没有总线预检查**、**没有 delay(500)**、直接 `endTransmission()`（带 STOP）第一次就发数据事务。如果 IMU 仍在启动、总线未空闲，STOP 分支会卡在 `while(!EVENTS_STOPPED)` 死循环。
+
+修复方案：把 v1.13 的完整成功序列原样搬进正式固件的 `imuBegin()`，并保留完整 BLE GATT + FIFO 流式传输。直接写 v2.2：
+
+
+
+===== message 1929 =====
+/*
+ * Motor AED XIAO - IMU streaming over BLE
+ * Firmware v2.2
+ *
+ * 变更 (v2.2):
+ *   - imuBegin() 完全移植 v1.13 验证过的成功序列:
+ *       BLE 启动后 delay(500)
+ *       供电后 pinMode(SDA/SCL, INPUT_PULLUP) 总线预检查
+ *       Wire1 @100kHz (非 400kHz)
+ *       先纯扫描确认 ACK (带重试, 覆盖 IMU 启动时序)
+ *       寄存器地址写用 endTransmission(false), 读用 requestFrom(STOP)
+ *   - 修复 v2.0/v2.1 首次 I2C 事务死锁 (卡在 endTransmission STOP 分支)
+ *   - 完整 BLE GATT: Data Notify + Config Write + MTU 247
+ *   - LSM6DS3TR-C FIFO 连续模式, 批量 notify
+ */
+#include <Arduino.h>
+#include <Wire.h>
+#include <bluefruit.h>
+#include <Adafruit_TinyUSB.h>
+
+#define FW_VERSION "v2.2"
+
+// ---- Pin / address ----
+#define PIN_IMU_PWR   PIN_LSM6DS3TR_C_POWER  // D15 = P1.08
+#define PIN_IMU_SDA   PIN_WIRE1_SDA          // D17 = P0.07
+#define PIN_IMU_SCL   PIN_WIRE1_SCL          // D16 = P0.27
+#define IMU_ADDR      0x6A
+
+// ---- LSM6DS3TR-C registers ----
+#define REG_WHO_AM_I      0x0F
+#define REG_CTRL1_XL      0x10
+#define REG_CTRL3_C       0x12
+#define REG_FIFO_CTRL3    0x09
+#define REG_FIFO_CTRL4    0x0A
+#define REG_FIFO_STATUS1  0x3A
+#define REG_FIFO_STATUS2  0x3B
+#define REG_FIFO_DATA_OUT_L 0x3E
+
+// ---- BLE ----
+// Service 7e8e0001-73d7-11ee-b96e-0242ac120002
+#define BLE_UUID_SVC_DATA   "7e8e0001-73d7-11ee-b96e-0242ac120002"
+#define BLE_UUID_CHR_NOTIFY "7e8e0002-73d7-11ee-b96e-0242ac120002"
+#define BLE_UUID_CHR_CONFIG "7e8e0003-73d7-11ee-b96e-0242ac120002"
+#define DEVICE_NAME "MotorAED-XIAO"
+
+BLEService        dataService(BLE_UUID_SVC_DATA);
+BLECharacteristic dataCharNotify(BLE_UUID_CHR_NOTIFY);
+BLECharacteristic configCharWrite(BLE_UUID_CHR_CONFIG);
+
+// 每 notify 批量样本数 (20 × 6B = 120B, 远小于 MTU 247)
+#define SAMPLES_PER_NOTIFY  20
+#define BYTES_PER_SAMPLE    6   // XL only: 3 x int16
+
+// ---- I2C primitives (v1.13 验证过的模式) ----
+
+// 纯扫描: 只发地址, 带 STOP. 返回是否 ACK
+static bool i2cScan(uint8_t addr) {
+  Wire1.beginTransmission(addr);
+  return Wire1.endTransmission() == 0;
+}
+
+// 写寄存器: 地址写用 endTransmission(false) (SUSPEND 分支, v1.13 验证)
+static bool i2cWrite(uint8_t reg, uint8_t val) {
+  Wire1.beginTransmission(IMU_ADDR);
+  Wire1.write(reg);
+  Wire1.write(val);
+  return Wire1.endTransmission(false) == 0;
+}
+
+// 读寄存器: endTransmission(false) + requestFrom(带 STOP), v1.13 验证
+static uint8_t i2cRead(uint8_t reg) {
+  Wire1.beginTransmission(IMU_ADDR);
+  Wire1.write(reg);
+  Wire1.endTransmission(false);
+  Wire1.requestFrom((uint8_t)IMU_ADDR, (uint8_t)1);
+  return Wire1.read();
+}
+
+// 读 FIFO 水位 (FIFO_STATUS1/2)
+static uint16_t fifoLevel(void) {
+  uint16_t l = i2cRead(REG_FIFO_STATUS1);
+  uint16_t h = i2cRead(REG_FIFO_STATUS2);
+  return (l & 0x1F) | ((h & 0x1F) << 5);
+}
+
+// ---- IMU init (完整移植 v1.13 成功序列) ----
+bool imuBegin(void) {
+  // 1) BLE 已启动, 延时让 SoftDevice/radio 稳定 (v1.13 关键)
+  delay(500);
+
+  // 2) IMU 供电
+  pinMode(PIN_IMU_PWR, OUTPUT);
+  digitalWrite(PIN_IMU_PWR, HIGH);
+  delay(150);
+
+  // 3) 总线预检查: 先切 GPIO INPUT_PULLUP, 强制拉高并确认 SDA/SCL 均空闲
+  pinMode(PIN_IMU_SDA, INPUT_PULLUP);
+  pinMode(PIN_IMU_SCL, INPUT_PULLUP);
+  delay(2);
+  int sda = digitalRead(PIN_IMU_SDA);
+  int scl = digitalRead(PIN_IMU_SCL);
+  Serial.printf("[IMU] bus check: SDA=%d SCL=%d %s\r\n", sda, scl,
+                (sda && scl) ? "OK (idle)" : "(NOT idle!)");
+
+  // 4) Wire1 @ 100kHz (v1.13 成功频率)
+  Wire1.begin();
+  Wire1.setClock(100000);
+  delay(5);
+
+  // 5) 先纯扫描, 带重试覆盖 IMU 启动时序
+  bool ack = false;
+  for (int i = 0; i < 5 && !ack; i++) {
+    ack = i2cScan(IMU_ADDR);
+    if (!ack) {
+      Serial.printf("[IMU] scan #%d: no ACK, retry...\r\n", i + 1);
+      delay(100);
+    }
+  }
+  if (!ack) {
+    Serial.println("[IMU] FAIL: no ACK at 0x6A");
+    return false;
+  }
+  Serial.println("[IMU] ACK ok");
+
+  // 6) WHO_AM_I
+  uint8_t wai = i2cRead(REG_WHO_AM_I);
+  Serial.printf("[IMU] WHO_AM_I = 0x%02X %s\r\n", wai,
+                (wai == 0x6A) ? "<<< LSM6DS3TR-C" : "(mismatch!)");
+  if (wai != 0x6A) {
+    Serial.println("[IMU] FAIL: WHO_AM_I mismatch");
+    return false;
+  }
+
+  // 7) 配置
+  i2cWrite(REG_CTRL3_C, 0x01); delay(50);   // SW_RESET
+  i2cWrite(REG_CTRL3_C, 0x44);              // BDU + IF_INC
+  i2cWrite(REG_FIFO_CTRL3, 0x01);           // FIFO: 只存 XL
+  i2cWrite(REG_FIFO_CTRL4, 0x06);           // FIFO: continuous
+  i2cWrite(REG_CTRL1_XL, 0x80);             // 1.66kHz, ±2g
+
+  Serial.println("[IMU] configured OK");
+  return true;
+}
+
+// ---- Setup ----
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // 灭
+
+  Serial.begin(115200);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) {
+    digitalWrite(LED_BUILTIN, (millis() / 200) & 1 ? LOW : HIGH);
+  }
+
+  // 最先打印版本号
+  Serial.printf("\r\n\r\n=== Motor AED XIAO Firmware %s ===\r\n", FW_VERSION);
+  Serial.flush();
+
+  // ---- BLE ----
+  Serial.println("Initializing BLE...");
+  Bluefruit.begin();
+  Bluefruit.setName(DEVICE_NAME);
+
+  // GATT
+  dataService.begin();
+  dataCharNotify.setProperties(CHR_PROPS_NOTIFY);
+  dataCharNotify.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  dataCharNotify.setMaxLen(BYTES_PER_SAMPLE * SAMPLES_PER_NOTIFY);
+  dataCharNotify.begin();
+  configCharWrite.setProperties(CHR_PROPS_WRITE);
+  configCharWrite.setPermission(SECMODE_OPEN, SECMODE_OPEN);
+  configCharWrite.setMaxLen(4);
+  configCharWrite.begin();
+  Serial.println("  GATT ready");
+
+  // 广播
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.start(0);
+  Serial.println("  Advertising started");
+  Serial.flush();
+
+  // ---- IMU (v1.13 验证序列) ----
+  Serial.println("Initializing IMU...");
+  Serial.flush();
+  bool ok = imuBegin();
+  if (!ok) {
+    Serial.println("IMU init FAILED - check wiring/power");
+    while (1) {  // 红灯快闪
+      digitalWrite(LED_BUILTIN, LOW); delay(100);
+      digitalWrite(LED_BUILTIN, HIGH); delay(100);
+    }
+  }
+
+  Serial.println("IMU streaming started");
+  Serial.flush();
+}
+
+// ---- Main loop: 读 FIFO -> 批量 notify ----
+uint8_t txBuf[BYTES_PER_SAMPLE * SAMPLES_PER_NOTIFY];
+
+void loop() {
+  // 有连接且 notify 已开启才采
+  if (!Bluefruit.connected() ||
+      !dataCharNotify.notifyEnabled()) {
+    digitalWrite(LED_BUILTIN, HIGH); // 灭
+    delay(100);
+    return;
+  }
+
+  uint16_t level = fifoLevel();
+  if (level < SAMPLES_PER_NOTIFY) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(1);
+    return;
+  }
+
+  // 读 SAMPLES_PER_NOTIFY 个样本 (每个 6 字节: X_L X_H Y_L Y_H Z_L Z_H)
+  uint8_t *p = txBuf;
+  for (uint8_t i = 0; i < SAMPLES_PER_NOTIFY; i++) {
+    for (uint8_t b = 0; b < BYTES_PER_SAMPLE; b++) {
+      *p++ = i2cRead(REG_FIFO_DATA_OUT_L);
+    }
+  }
+
+  dataCharNotify.notify(txBuf, sizeof(txBuf));
+  digitalWrite(LED_BUILTIN, LOW); // 采到一包, 亮一下
+}
+
+
+===== message 1983 =====
+/*
+ * 诊断固件 v2.3 - 总线钳位原因分析
+ *
+ * v2.2 发现: bus check SDA=0 SCL=0 (NOT idle!), 之后 i2cScan 死锁 (endTransmission 卡 while(!EVENTS_STOPPED))
+ * 本固件: 全程不调用任何 Wire1 事务 (杜绝死锁), 专测:
+ *   A. 供电前 SDA/SCL 电平 (判断板载上拉是否存在)
+ *   B. 供电后 0~1000ms 轮询总线, 记录 IMU 何时释放 (若 boot 期间拉低)
+ *   C. 总线空闲时再 i2cScan + WHO_AM_I
+ *   D. 若总线一直忙: power cycle (OFF/ON) 看能否恢复
+ */
+#include <Arduino.h>
+#include <Wire.h>
+#include <bluefruit.h>
+#include <Adafruit_TinyUSB.h>
+
+#define FW_VERSION "v2.3"
+
+#define PIN_IMU_PWR   PIN_LSM6DS3TR_C_POWER  // D15 = P1.08
+#define PIN_IMU_SDA   PIN_WIRE1_SDA          // D17 = P0.07
+#define PIN_IMU_SCL   PIN_WIRE1_SCL          // D16 = P0.27
+#define IMU_ADDR      0x6A
+#define REG_WHO_AM_I  0x0F
+
+// 切 GPIO INPUT_PULLUP 读 SDA/SCL, 返回 (sda<<1)|scl
+static int readBusLevels(void) {
+  pinMode(PIN_IMU_SDA, INPUT_PULLUP);
+  pinMode(PIN_IMU_SCL, INPUT_PULLUP);
+  delay(2);
+  int sda = digitalRead(PIN_IMU_SDA);
+  int scl = digitalRead(PIN_IMU_SCL);
+  return (sda << 1) | scl;   // 3 = 1/1 idle, 0 = 0/0, 1 = SDA0/SCL1, 2 = SDA1/SCL0
+}
+
+static void printLevels(const char *label, int lvl) {
+  Serial.printf("  %-30s: SDA=%d SCL=%d %s\r\n", label, (lvl >> 1) & 1, lvl & 1,
+                (lvl == 3) ? "<<< IDLE" : (lvl == 0 ? "<<< BOTH LOW (clamped)" : ""));
+  Serial.flush();
+}
+
+// 只有总线空闲才调用 (避免死锁)
+static bool i2cScanIdle(uint8_t addr) {
+  Wire1.beginTransmission(addr);
+  return Wire1.endTransmission() == 0;
+}
+
+static uint8_t i2cReadIdle(uint8_t reg) {
+  Wire1.beginTransmission(IMU_ADDR);
+  Wire1.write(reg);
+  Wire1.endTransmission(false);
+  Wire1.requestFrom((uint8_t)IMU_ADDR, (uint8_t)1);
+  return Wire1.read();
+}
+
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  Serial.begin(115200);
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 3000) {
+    digitalWrite(LED_BUILTIN, (millis() / 200) & 1 ? LOW : HIGH);
+  }
+
+  Serial.printf("\r\n\r\n=== FW %s (bus clamp diagnosis) ===\r\n", FW_VERSION);
+  Serial.flush();
+
+  // --- BLE 最小初始化 (v1.13 顺序) ---
+  Serial.println("Initializing BLE...");
+  Bluefruit.begin();
+  Bluefruit.setName("MotorAED-XIAO");
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.start(0);
+  Serial.println("  BLE OK");
+  Serial.flush();
+  delay(500);   // v1.13 关键
+
+  Serial.println("\r\n--- Bus diagnosis ---");
+
+  // A. 供电前
+  int lvl = readBusLevels();
+  printLevels("A. Power OFF, bus", lvl);
+
+  // B. 供电 ON, 轮询总线释放
+  Serial.println("  B. Power ON, polling SDA/SCL up to 1000ms...");
+  Serial.flush();
+  pinMode(PIN_IMU_PWR, OUTPUT);
+  digitalWrite(PIN_IMU_PWR, HIGH);
+  uint32_t releasedMs = 0;
+  for (uint32_t ms = 0; ms <= 1000; ms += 50) {
+    lvl = readBusLevels();
+    if (ms % 100 == 0 || lvl != 3) {
+      Serial.printf("     t=%4u ms  SDA=%d SCL=%d%s\r\n", ms, (lvl >> 1) & 1, lvl & 1,
+                    (lvl == 3) ? " <<< IDLE" : "");
+      Serial.flush();
+    }
+    if (lvl == 3) { releasedMs = ms; break; }
+    delay(50);
+  }
+
+  if (releasedMs > 0) {
+    Serial.printf("  BUS released at t=%u ms after power ON\r\n", releasedMs);
+    Serial.flush();
+
+    // C. 总线空闲, 安全地做 I2C
+    Serial.println("  C. Bus idle, starting Wire1 @100kHz...");
+    Wire1.begin();
+    Wire1.setClock(100000);
+    delay(5);
+    bool ack = i2cScanIdle(IMU_ADDR);
+    Serial.printf("     scan 0x%02X: %s\r\n", IMU_ADDR, ack ? "ACK" : "NO ACK");
+    Serial.flush();
+    if (ack) {
+      uint8_t wai = i2cReadIdle(REG_WHO_AM_I);
+      Serial.printf("     WHO_AM_I = 0x%02X %s\r\n", wai, (wai == 0x6A) ? "<<< LSM6DS3TR-C!" : "(mismatch)");
+      Serial.flush();
+    }
+  } else {
+    // D. 总线一直忙: power cycle 看能否恢复
+    Serial.println("  D. Bus stayed clamped 1000ms. Power cycling (OFF 100ms, ON 300ms)...");
+    Serial.flush();
+    digitalWrite(PIN_IMU_PWR, LOW);
+    delay(100);
+    lvl = readBusLevels();
+    printLevels("     Power OFF, bus", lvl);
+    digitalWrite(PIN_IMU_PWR, HIGH);
+    delay(300);
+    lvl = readBusLevels();
+    printLevels("     Power ON +300ms, bus", lvl);
+    if (lvl == 3) {
+      Serial.println("     Bus recovered after power cycle! Trying I2C...");
+      Serial.flush();
+      Wire1.begin();
+      Wire1.setClock(100000);
+      delay(5);
+      bool ack = i2cScanIdle(IMU_ADDR);
+      Serial.printf("     scan 0x%02X: %s\r\n", IMU_ADDR, ack ? "ACK" : "NO ACK");
+      Serial.flush();
+      if (ack) {
+        uint8_t wai = i2cReadIdle(REG_WHO_AM_I);
+        Serial.printf("     WHO_AM_I = 0x%02X %s\r\n", wai, (wai == 0x6A) ? "<<< LSM6DS3TR-C!" : "(mismatch)");
+        Serial.flush();
+      }
+    }
+  }
+
+  Serial.println("\r\n=== DIAG COMPLETE ===");
+  Serial.flush();
+}
+
+void loop() {
+  digitalWrite(LED_BUILTIN, (millis() / 500) & 1 ? LOW : HIGH);  // 慢闪表示结束
+  delay(100);
+}
+
+
